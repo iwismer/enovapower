@@ -422,8 +422,12 @@ class AsyncEnovaClient:
         Populates :attr:`meter_ids` with every meter found and sets the active
         :attr:`meter_id` to the first. Use :meth:`select_meter` to switch.
 
-        NOTE: Single-meter discovery (the ``refresh_btn`` href, and the single
-        ``selectedMeterId`` input fallback) is verified. **Multi-meter** discovery
+        Checks ``#refresh_btn`` first, then dashboard ``selectAccount`` links
+        carrying ``inMeterID=`` (scoped to the active/first account), and
+        finally falls back to the ``smartMeterConsumV3`` page (form fields and
+        inline script ``meterId=`` URLs).
+
+        NOTE: Single-meter discovery is verified. **Multi-meter** discovery
         (the ``<select>`` branch in :meth:`_extract_meter_ids_from_form`) is
         SPECULATIVE — it has not been validated against a real multi-meter
         account's markup. The downstream multi-meter API (``meter_ids``,
@@ -433,12 +437,36 @@ class AsyncEnovaClient:
         """
         meter_ids: list[str] = []
 
+        # Check #refresh_btn first (historical markup).
         refresh_link = soup.find("a", id="refresh_btn")
         if refresh_link:
-            href = refresh_link.get("href", "")
+            href = refresh_link.get("href")
             if isinstance(href, str) and "inMeterID=" in href:
-                parsed = urlparse(href)
-                qs = parse_qs(parsed.query)
+                qs = parse_qs(urlparse(href).query)
+                for mid in qs.get("inMeterID", []):
+                    if mid and mid not in meter_ids:
+                        meter_ids.append(mid)
+
+        # On newer portal markup #refresh_btn has href="#" (populated by JS at
+        # runtime), while dashboard selectAccount links carry inMeterID=. Scope
+        # to the active/first inAccountNumber so multi-account switchers don't
+        # mix meters from unselected accounts.
+        if not meter_ids:
+            active_account: str | None = None
+            for link in soup.find_all("a", href=True):
+                href = link.get("href")
+                if not isinstance(href, str) or "inMeterID=" not in href:
+                    continue
+                qs = parse_qs(urlparse(href).query)
+                meter_types = [t.lower() for t in qs.get("meterType", [])]
+                if meter_types and not any(t in {"electric", "hydro"} for t in meter_types):
+                    continue
+                accounts = qs.get("inAccountNumber", [])
+                if accounts:
+                    if active_account is None:
+                        active_account = accounts[0]
+                    elif accounts[0] != active_account:
+                        continue
                 for mid in qs.get("inMeterID", []):
                     if mid and mid not in meter_ids:
                         meter_ids.append(mid)
@@ -459,7 +487,7 @@ class AsyncEnovaClient:
                 meter_ids = self._extract_meter_ids_from_form(iframe_soup)
                 # Single-meter accounts leave the selectedMeterId field empty; the
                 # meter id then only appears in a page script (the custom-events
-                # widget URL, "...&meterId=<digits>&..."). Fall back to that.
+                # widget URL, "...&meterId=<id>&..."). Fall back to that.
                 if not meter_ids:
                     meter_ids = self._extract_meter_ids_from_script(text)
             except EnovaNetworkError as err:
@@ -504,11 +532,12 @@ class AsyncEnovaClient:
 
         On single-meter accounts the ``selectedMeterId`` form field is empty, so
         the meter id only appears in a script URL such as
-        ``/app/capricorn?para=editCustomEvents&meterId=136674&...``. Collect every
-        distinct ``meterId=<digits>`` (query-parameter form) in document order.
+        ``/app/capricorn?para=editCustomEvents&meterId=136674&...`` or
+        ``...&meterId=KWH123456&...``. Collect every distinct alphanumeric
+        ``meterId=<id>`` (query-parameter form) in document order.
         """
         meter_ids: list[str] = []
-        for mid in re.findall(r"[?&]meterId=(\d+)", html):
+        for mid in re.findall(r"(?:[?&]|&amp;)meterId=([A-Za-z0-9_-]+)", html):
             if mid not in meter_ids:
                 meter_ids.append(mid)
         return meter_ids

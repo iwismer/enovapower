@@ -345,11 +345,85 @@ class TestAsyncExtractAccountInfo:
         assert client._meter_id == "136674"
         assert client._meter_ids == ["136674"]
 
+    async def test_extract_alphanumeric_meter_from_select_account_link(self):
+        """When #refresh_btn has href='#', fall back to selectAccount links."""
+        from bs4 import BeautifulSoup
+        html = (
+            '<html><body>'
+            '<a id="refresh_btn" href="#">Refresh</a>'
+            '<a href="/app/capricorn?para=selectAccount&userAction=select'
+            '&inAccountNumber=1234567890&inMeterID=WTR999999&meterType=Water">Water</a>'
+            '<a href="/app/capricorn?para=selectAccount&userAction=select'
+            '&inAccountNumber=1234567890&inMeterID=KWH123456&meterType=Electric">Electric</a>'
+            '<a href="/app/capricorn?para=selectAccount&userAction=select'
+            '&inAccountNumber=1234567890&inMeterID=KWH123456&meterType=Electric">Dup</a>'
+            '<a href="/app/capricorn?para=selectAccount&userAction=select'
+            '&inAccountNumber=9999999999&inMeterID=KWH777777&meterType=Electric">OtherAcct</a>'
+            '</body></html>'
+        )
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = AsyncEnovaClient(session=session)
+        soup = BeautifulSoup(html, "html.parser")
+        await client._extract_account_info(soup)
+        assert client._meter_id == "KWH123456"
+        assert client._meter_ids == ["KWH123456"]
+
+    async def test_refresh_btn_takes_precedence_over_other_account_links(self):
+        """When #refresh_btn already has inMeterID, ignore other selectAccount links."""
+        from bs4 import BeautifulSoup
+        html = (
+            '<html><body>'
+            '<a id="refresh_btn" href="/app/capricorn?para=selectAccount&userAction=refresh'
+            '&inAccountNumber=1111111111&inMeterID=111111">Refresh</a>'
+            '<a href="/app/capricorn?para=selectAccount&userAction=select'
+            '&inAccountNumber=2222222222&inMeterID=KWH222222&meterType=Electric">Other</a>'
+            '</body></html>'
+        )
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = AsyncEnovaClient(session=session)
+        soup = BeautifulSoup(html, "html.parser")
+        await client._extract_account_info(soup)
+        assert client._meter_id == "111111"
+        assert client._meter_ids == ["111111"]
+
+    async def test_select_account_accepts_hydro_and_missing_meter_type(self):
+        """Both meterType=Hydro and omitted meterType are accepted."""
+        from bs4 import BeautifulSoup
+        html = (
+            '<html><body>'
+            '<a id="refresh_btn" href="#">Refresh</a>'
+            '<a href="/app/capricorn?para=selectAccount&inAccountNumber=123'
+            '&inMeterID=KWH111&meterType=Hydro">Hydro</a>'
+            '<a href="/app/capricorn?para=selectAccount&inAccountNumber=123'
+            '&inMeterID=KWH222">NoType</a>'
+            '</body></html>'
+        )
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = AsyncEnovaClient(session=session)
+        soup = BeautifulSoup(html, "html.parser")
+        await client._extract_account_info(soup)
+        assert client._meter_id == "KWH111"
+        assert client._meter_ids == ["KWH111", "KWH222"]
+
 
 class TestExtractMeterIdsFromScript:
     def test_extracts_meter_id_from_widget_url(self):
         html = 'x = "/app/capricorn?para=editCustomEvents&meterId=136674&viewInChart=TOU";'
         assert AsyncEnovaClient._extract_meter_ids_from_script(html) == ["136674"]
+
+    def test_extracts_alphanumeric_meter_id(self):
+        html = (
+            'x = "/app/capricorn?para=editCustomEvents&meterId=KWH123456&viewInChart=TOU";'
+            'y = "/app/capricorn?para=editCustomEvents&amp;meterId=KWH-98_7&amp;viewInChart=TOU";'
+        )
+        assert AsyncEnovaClient._extract_meter_ids_from_script(html) == [
+            "KWH123456",
+            "KWH-98_7",
+        ]
+
+    def test_ignores_js_concatenation_meter_id(self):
+        html = 'url = "/app/capricorn?para=editCustomEvents&meterId=" + meterId;'
+        assert AsyncEnovaClient._extract_meter_ids_from_script(html) == []
 
     def test_ignores_empty_selected_meter_id(self):
         # An empty selectedMeterId= must not be read as a meter id.
